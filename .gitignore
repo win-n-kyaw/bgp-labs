@@ -1,0 +1,40 @@
+# Vagrant
+.vagrant/
+*.box
+
+# VirtualBox
+*.vdi
+*.vmdk
+*.vhd
+*.ova
+*.ovf
+
+# OS
+.DS_Store
+Thumbs.db
+*~
+*.swp
+*.swo
+
+# Editor / IDE
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# Logs
+*.log
+
+# SSH keys
+*.pem
+*.key
+id_rsa
+id_rsa.*
+
+# Environment / secrets
+.env
+.env.*
+
+# private
+PLAN.md
+RUNBOOK.md

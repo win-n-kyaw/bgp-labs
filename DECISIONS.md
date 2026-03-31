@@ -74,6 +74,70 @@ Link r1<->r2 fails (enp0s8 goes down):
 
 ---
 
+## 2026-03-31: `network` command and return-path reachability
+
+### Decision
+Always advertise a router's connected link subnets via `network` statements in BGP, not just loopbacks.
+
+### Problem Statement
+After configuring r4 with eBGP peering to r1, r4 received routes to 2.2.2.2/32 and 3.3.3.3/32 (via r1). But pings to those loopbacks failed — 100% packet loss.
+
+r4 had the **forward path** (BGP route to destination), but remote routers lacked a **return path** to r4's source IP.
+
+### What happened
+
+```
+r4 pings 2.2.2.2:
+  r4 (src 10.0.14.5) → r1 → r2 (receives echo request)
+  r2 replies to 10.0.14.5 → r2 has route to 10.0.14.0/24 via r1 → reply reaches r4  ✓
+
+r4 pings 3.3.3.3:
+  r4 (src 10.0.14.5) → r1 → r2 → r3 (receives echo request)
+  r3 replies to 10.0.14.5 → r3 needs route to 10.0.14.0/24
+```
+
+The initial failure was a combination of BGP convergence timing (the r4↔r1 session was only 20 seconds old) and incomplete route advertisement. Once r4 added `network 10.0.14.0/24` and `network 10.0.34.0/24`, those prefixes propagated through the ring via r1 → r2 → r3, ensuring every router had explicit return paths to r4.
+
+### Key takeaway
+The `network` command does not create routes — it tells BGP to **advertise** an existing route (connected, static, etc.) to peers. A router with only a loopback `network` statement has reachable BGP sessions but its link subnets are invisible to the rest of the network, breaking return-path reachability for traffic sourced from those links.
+
+---
+
+## 2026-03-31: Routes vs paths in a ring topology
+
+### Decision
+Understand that route count and path count are independent metrics. Route count determines reachability; path count determines redundancy and failover options.
+
+### Observation
+After completing the 4-router eBGP ring, all routers had the same 8 routes but different path counts:
+
+| Router | Routes | Paths |
+|--------|--------|-------|
+| r1 | 8 | 11 |
+| r2 | 8 | 13 |
+| r3 | 8 | 15 |
+| r4 | 8 | 13 |
+
+### Why path counts differ
+In a ring, each prefix can be reached clockwise or counterclockwise. But BGP limits path visibility through three rules:
+
+1. **Best-path-only advertisement** — a router only advertises its single best path to each peer, not all known paths.
+2. **No re-advertisement to source** — a route learned from peer X is never sent back to peer X.
+3. **Tiebreaker asymmetry** — when two paths have equal AS path length, the lowest neighbor IP wins. This determines which path becomes "best", which in turn controls what gets re-advertised.
+
+r1 has the lowest link IPs (10.0.12.2, 10.0.14.2), so both r2 and r4 tend to learn their best paths from r1 — and won't re-advertise them back. r1 sees the fewest alternatives.
+
+r3's neighbors (r2, r4) learned most best paths from their *other* neighbor (r1), not from r3, so they freely advertise alternatives to r3. r3 sees the most alternatives.
+
+### When alternative paths matter
+- **Failover** — if the best path goes down, the alternative is promoted instantly (no reconvergence wait)
+- **Load balancing** — `maximum-paths N` installs multiple equal-cost paths into the forwarding table
+- **Policy** — route-maps can prefer a longer AS path based on business rules (customer vs transit)
+
+For day-to-day forwarding, only the best path (`*>`) is used. Alternative paths are insurance.
+
+---
+
 ## Progress Log
 
 ### 2026-03-29
@@ -94,3 +158,13 @@ Link r1<->r2 fails (enp0s8 goes down):
 - [x] Created RUNBOOK1a.md with full step-by-step reproduction guide
 - [x] Added .gitignore for Vagrant, VirtualBox, and sensitive files
 - [x] Resolved transient r2 boot timeout (resource contention — added recovery steps to runbook)
+
+### 2026-03-31
+- [x] Booted r4, configured eBGP peering with r1 and r3
+- [x] Observed partial ring behavior (r4↔r1 up, r4↔r3 intentionally Active)
+- [x] Diagnosed return-path reachability failure — missing `network` statements on r4
+- [x] Completed ring: added r4 as neighbor on r3
+- [x] Analyzed routes vs paths across all routers (8 routes, 11–15 paths)
+- [x] Verified full reachability: 48/48 pings (loopbacks + link IPs)
+- [x] Completed lab1b milestone (4-router eBGP ring)
+- [x] Created RUNBOOK1b.md

@@ -17,7 +17,7 @@ r4 (AS65004) ---eth1--- r3 (AS65003)
 ## Progress
 
 - [x] **Lab 1a** — 3-router eBGP string (r1 ↔ r2 ↔ r3). End-to-end reachability verified.
-- [ ] **Lab 1b** — Complete the ring (add r4), full-mesh eBGP peering.
+- [x] **Lab 1b** — Complete the ring (add r4), full-mesh eBGP peering. 48/48 reachability.
 - [ ] **Lab 2** — Route filtering with prefix-lists and route-maps.
 
 ## Quick Start

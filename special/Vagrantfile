@@ -1,0 +1,266 @@
+Vagrant.configure("2") do |config|
+  config.vm.box = "ubuntu/jammy64"
+  config.vm.boot_timeout = 600
+
+  # ============================================================================
+  # SEARB Banking Sector BGP Lab — AS 64512
+  # ============================================================================
+  #
+  # Topology (8 nodes):
+  #
+  #   External Peers (SG)           SEARB Internal (AS 64512)        External Peers (KL)
+  #   =====================         ========================         ===================
+  #   singtel  AS 7473  ─── L1 ───┐
+  #
+  #   sgix     IXP RS   ─── L3 ───┼─── sg-br1 (SG-RR1) ─── L7 ─── kl-br1 (KL-RR2) ─── L4 ─── tmnet  AS 4788
+  #   swift    AS 19905 ─── L5 ───┤        │                             │─── L9 ─── swift  AS 19905
+  #   aws      AS 16509 ─── L6 ───┘        │
+  #                                    L8 (iBGP)
+  #                                         │
+  #                                    bkk-br1 (DR)
+  #
+  # Point-to-point links (/24):
+  #   L1: 10.0.1.0/24  sg-br1(.1)  <-> singtel(.2)
+  #
+  #   L3: 10.0.3.0/24  sg-br1(.1)  <-> sgix(.2)
+  #   L4: 10.0.4.0/24  kl-br1(.1)  <-> tmnet(.2)
+  #   L5: 10.0.5.0/24  sg-br1(.1)  <-> swift(.2)
+  #   L6: 10.0.6.0/24  sg-br1(.1)  <-> aws(.2)
+  #   L7: 10.0.7.0/24  sg-br1(.1)  <-> kl-br1(.2)
+  #   L8: 10.0.8.0/24  sg-br1(.1)  <-> bkk-br1(.2)
+  #   L9: 10.0.9.0/24  kl-br1(.1)  <-> swift(.2)
+  #
+  # VirtualBox NIC → kernel interface mapping (Ubuntu 22.04):
+  #   Adapter 1 (NAT):  enp0s3   ← Vagrant SSH — never touch this
+  #   Adapter 2:        enp0s8
+  #   Adapter 3:        enp0s9
+  #   Adapter 4:        enp0s10
+  #   Adapter 5:        enp0s16  ← PCI slot numbering jumps here
+  #   Adapter 6:        enp0s17
+  #   Adapter 7:        enp0s18
+  #   Adapter 8:        enp0s19
+  # ============================================================================
+
+  # --------------------------------------------------------------------------
+  # FIX: prevent systemd-networkd from running DHCP on lab interfaces.
+  #
+  # Root cause of the original failure: when `ip link set dev <iface> up` is
+  # called, systemd-networkd (Jammy default) detects the carrier-up event and
+  # applies its catch-all DHCP policy to the new interface. The resulting DHCP
+  # traffic briefly disturbs the network stack and kills the Vagrant SSH
+  # session (which runs over the NAT adapter enp0s3).
+  #
+  # Fix: write a 10-<iface>.network drop-in for each lab interface that sets
+  # DHCP=no and a static address BEFORE calling `ip link set ... up`. networkd
+  # sees the explicit config and skips DHCP. We then still use `ip addr add`
+  # for immediate effect (networkd picks up the persisted config on reboot).
+  # --------------------------------------------------------------------------
+
+  # --- Provisioner: IP forwarding -------------------------------------------
+  $enable_forwarding = <<-SCRIPT
+    set -e
+    grep -q "net.ipv4.ip_forward=1" /etc/sysctl.conf || \
+      echo "net.ipv4.ip_forward=1" | sudo tee -a /etc/sysctl.conf
+    sudo sysctl -w net.ipv4.ip_forward=1
+  SCRIPT
+
+  # --- Provisioner: interface configuration ---------------------------------
+  # Usage: args: "enp0s8:10.0.1.1/24 enp0s9:10.0.2.1/24 ..."
+  #
+  # Step 1 – Write a systemd-networkd .network file with DHCP=no for each
+  #          interface. networkd reads this before acting on carrier events, so
+  #          it will NOT attempt DHCP when the link comes up.
+  # Step 2 – Bring the link up and assign the IP with `ip` for immediate use.
+  #          (networkd will apply the static address on its own at next boot.)
+  $configure_interfaces = <<-SCRIPT
+    set -e
+    sudo mkdir -p /etc/systemd/network
+    for pair in "$@"; do
+      IFACE="${pair%%:*}"
+      ADDR="${pair##*:}"
+
+      # Write drop-in before touching the link so networkd never starts DHCP
+      sudo tee /etc/systemd/network/10-${IFACE}.network > /dev/null <<EOF
+[Match]
+Name=${IFACE}
+
+[Network]
+DHCP=no
+Address=${ADDR}
+LinkLocalAddressing=no
+EOF
+
+      # Bring up immediately for the current session
+      sudo ip link set dev "${IFACE}" up 2>/dev/null || true
+      sudo ip addr add "${ADDR}" dev "${IFACE}" 2>/dev/null || true
+    done
+  SCRIPT
+
+  # --- Provisioner: install FRR --------------------------------------------
+  $frr_install = <<-SCRIPT
+    set -e
+    export DEBIAN_FRONTEND=noninteractive
+    if ! command -v vtysh &>/dev/null; then
+      curl -s https://deb.frrouting.org/frr/keys.gpg \
+        | sudo tee /usr/share/keyrings/frrouting.gpg > /dev/null
+      FRRVER="frr-stable"
+      echo "deb [signed-by=/usr/share/keyrings/frrouting.gpg] \
+https://deb.frrouting.org/frr $(lsb_release -s -c) $FRRVER" \
+        | sudo tee /etc/apt/sources.list.d/frr.list
+      sudo apt-get update -qq
+      sudo apt-get install -y -qq frr frr-pythontools
+    fi
+    sudo sed -i 's/^bgpd=no/bgpd=yes/'   /etc/frr/daemons
+    sudo sed -i 's/^ospfd=no/ospfd=yes/' /etc/frr/daemons
+    sudo systemctl restart frr
+  SCRIPT
+
+  # --- Provisioner: apply FRR config ---------------------------------------
+  # Usage: args: "sg-br1-frr.conf"
+  $apply_frr_conf = <<-SCRIPT
+    CONF_FILE=$1
+    if [ -f "/vagrant/config/${CONF_FILE}" ]; then
+      sudo cp /vagrant/config/${CONF_FILE} /etc/frr/frr.conf
+      sudo chown frr:frr /etc/frr/frr.conf
+      sudo chmod 640    /etc/frr/frr.conf
+      sudo systemctl restart frr
+      echo "FRR config applied: ${CONF_FILE}"
+    else
+      echo "WARNING: /vagrant/config/${CONF_FILE} not found — skipping"
+    fi
+  SCRIPT
+
+  # Helper: apply provisioners in the same order for every node
+  # (called as a Ruby proc to avoid repetition)
+  define_node = ->(node, iface_args, frr_conf) do
+    node.vm.provision "shell", name: "ip-forward",    inline: $enable_forwarding
+    node.vm.provision "shell", name: "iface-config",  inline: $configure_interfaces, args: iface_args
+    node.vm.provision "shell", name: "frr-install",   inline: $frr_install
+    node.vm.provision "shell", name: "frr-conf",      inline: $apply_frr_conf, args: frr_conf
+  end
+
+  # ==========================================================================
+  # SEARB Internal Routers — AS 64512
+  # ==========================================================================
+
+  # SG Border Router + Route Reflector 1
+  # 6 private_network adapters → enp0s8..enp0s10, enp0s16..enp0s18
+  config.vm.define "sg-br1" do |node|
+    node.vm.hostname = "sg-br1"
+    node.vm.network "private_network", auto_config: false, virtualbox__intnet: "link_sg_singtel"  # L1
+    node.vm.network "private_network", auto_config: false, virtualbox__intnet: "link_sg_sgix"     # L3
+    node.vm.network "private_network", auto_config: false, virtualbox__intnet: "link_sg_swift"    # L5
+    node.vm.network "private_network", auto_config: false, virtualbox__intnet: "link_sg_aws"      # L6
+    node.vm.network "private_network", auto_config: false, virtualbox__intnet: "link_sg_kl"       # L7
+    node.vm.network "private_network", auto_config: false, virtualbox__intnet: "link_sg_bkk"      # L8
+    node.vm.provider "virtualbox" do |vb|
+      vb.name   = "searb-sg-br1-as64512"
+      vb.memory = "512"
+      vb.cpus   = 1
+    end
+    define_node.call(
+      node,
+      "enp0s8:10.0.1.1/24 enp0s9:10.0.3.1/24 enp0s10:10.0.5.1/24 " \
+      "enp0s16:10.0.6.1/24 enp0s17:10.0.7.1/24 enp0s18:10.0.8.1/24",
+      "sg-br1-frr.conf"
+    )
+  end
+
+  # KL Border Router + Route Reflector 2
+  # 3 private_network adapters → enp0s8..enp0s10
+  config.vm.define "kl-br1" do |node|
+    node.vm.hostname = "kl-br1"
+    node.vm.network "private_network", auto_config: false, virtualbox__intnet: "link_kl_tmnet"    # L4
+    node.vm.network "private_network", auto_config: false, virtualbox__intnet: "link_sg_kl"       # L7
+    node.vm.network "private_network", auto_config: false, virtualbox__intnet: "link_kl_swift"    # L9
+    node.vm.provider "virtualbox" do |vb|
+      vb.name   = "searb-kl-br1-as64512"
+      vb.memory = "512"
+      vb.cpus   = 1
+    end
+    define_node.call(
+      node,
+      "enp0s8:10.0.4.1/24 enp0s9:10.0.7.2/24 enp0s10:10.0.9.1/24",
+      "kl-br1-frr.conf"
+    )
+  end
+
+  # BKK Disaster-Recovery Router
+  # 1 private_network adapter → enp0s8
+  config.vm.define "bkk-br1" do |node|
+    node.vm.hostname = "bkk-br1"
+    node.vm.network "private_network", auto_config: false, virtualbox__intnet: "link_sg_bkk"      # L8
+    node.vm.provider "virtualbox" do |vb|
+      vb.name   = "searb-bkk-br1-as64512"
+      vb.memory = "512"
+      vb.cpus   = 1
+    end
+    define_node.call(node, "enp0s8:10.0.8.2/24", "bkk-br1-frr.conf")
+  end
+
+  # ==========================================================================
+  # External Peer Simulators
+  # ==========================================================================
+
+  # SingTel — AS 7473 (Primary Transit, SG)
+  config.vm.define "singtel" do |node|
+    node.vm.hostname = "singtel"
+    node.vm.network "private_network", auto_config: false, virtualbox__intnet: "link_sg_singtel"  # L1
+    node.vm.provider "virtualbox" do |vb|
+      vb.name   = "searb-singtel-as7473"
+      vb.memory = "512"
+      vb.cpus   = 1
+    end
+    define_node.call(node, "enp0s8:10.0.1.2/24", "singtel-frr.conf")
+  end
+
+  # SGIX — IXP Route Server (Public Peer, SG)
+  config.vm.define "sgix" do |node|
+    node.vm.hostname = "sgix"
+    node.vm.network "private_network", auto_config: false, virtualbox__intnet: "link_sg_sgix"     # L3
+    node.vm.provider "virtualbox" do |vb|
+      vb.name   = "searb-sgix-ixp"
+      vb.memory = "512"
+      vb.cpus   = 1
+    end
+    define_node.call(node, "enp0s8:10.0.3.2/24", "sgix-frr.conf")
+  end
+
+  # TM Net — AS 4788 (Transit, KL)
+  config.vm.define "tmnet" do |node|
+    node.vm.hostname = "tmnet"
+    node.vm.network "private_network", auto_config: false, virtualbox__intnet: "link_kl_tmnet"    # L4
+    node.vm.provider "virtualbox" do |vb|
+      vb.name   = "searb-tmnet-as4788"
+      vb.memory = "512"
+      vb.cpus   = 1
+    end
+    define_node.call(node, "enp0s8:10.0.4.2/24", "tmnet-frr.conf")
+  end
+
+  # SWIFT — AS 19905 (Private Peer, SG + KL — dual-homed)
+  # 2 private_network adapters → enp0s8, enp0s9
+  config.vm.define "swift" do |node|
+    node.vm.hostname = "swift"
+    node.vm.network "private_network", auto_config: false, virtualbox__intnet: "link_sg_swift"    # L5
+    node.vm.network "private_network", auto_config: false, virtualbox__intnet: "link_kl_swift"    # L9
+    node.vm.provider "virtualbox" do |vb|
+      vb.name   = "searb-swift-as19905"
+      vb.memory = "512"
+      vb.cpus   = 1
+    end
+    define_node.call(node, "enp0s8:10.0.5.2/24 enp0s9:10.0.9.2/24", "swift-frr.conf")
+  end
+
+  # AWS Direct Connect — AS 16509 (Cloud Peer, SG)
+  config.vm.define "aws" do |node|
+    node.vm.hostname = "aws"
+    node.vm.network "private_network", auto_config: false, virtualbox__intnet: "link_sg_aws"      # L6
+    node.vm.provider "virtualbox" do |vb|
+      vb.name   = "searb-aws-as16509"
+      vb.memory = "512"
+      vb.cpus   = 1
+    end
+    define_node.call(node, "enp0s8:10.0.6.2/24", "aws-frr.conf")
+  end
+end
